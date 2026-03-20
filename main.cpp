@@ -10,14 +10,16 @@
  *    2. MZ_ZIP_FLAG_DO_NOT_SORT_CENTRAL_DIRECTORY 跳过不必要的排序
  *    3. QuickGetTag 使用纯 C strstr，不构造临时 std::string 标签
  *    4. 决策逻辑合并为单次 if-else，避免重复 find()
- *    5. RAII 风格的 ZipGuard 确保 zip 句柄始终被关闭
+ *    5. RAII 风格的 ZipGuard 确保 zip 套柄始终被关闭
  *    6. SW_SHOWNORMAL 替代 SW_SHOW，行为更稳定
+ *    7. 日志记录，便于排查问题
  * ============================================================================
  */
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <shellapi.h>
+#include <cstdio>
 #include <cstring>
 #include <string>
 
@@ -25,6 +27,46 @@
 #define MINIZ_NO_ARCHIVE_WRITING_APIS // 只需要读，禁用写接口
 #define MINIZ_IMPLEMENTATION
 #include "miniz.h"
+
+// ============================================================================
+//  日志配置
+// ============================================================================
+static const char* LOG_DIR = "d:\\logs";
+static const char* LOG_FILE = "d:\\logs\\pptx_selecter.log";
+static const bool ENABLE_LOG = true;
+
+// ============================================================================
+//  初始化日志目录：确保 d:\logs 文件夹存在
+// ============================================================================
+static void InitLogDir() {
+    // 创建日志目录（如果不存在）
+    CreateDirectoryA(LOG_DIR, nullptr);
+}
+
+// ============================================================================
+//  日志函数：追加写入日志文件
+// ============================================================================
+static void Log(const char* format, ...) {
+    if (!ENABLE_LOG) return;
+
+    FILE* fp = nullptr;
+    fopen_s(&fp, LOG_FILE, "a");
+    if (!fp) return;
+
+    // 获取当前时间
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    fprintf(fp, "[%04d-%02d-%02d %02d:%02d:%02d] ",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+
+    va_list args;
+    va_start(args, format);
+    vfprintf(fp, format, args);
+    va_end(args);
+
+    fprintf(fp, "\n");
+    fclose(fp);
+}
 
 // ============================================================================
 //  配置区域：根据教室电脑实际路径修改
@@ -82,7 +124,11 @@ static bool SafeLaunchApp(const char* exe, const char* filePath) {
 
     const auto r = reinterpret_cast<intptr_t>(
         ShellExecuteA(nullptr, "open", exe, quoted, nullptr, SW_SHOWNORMAL));
-    return r > 32;
+
+    bool success = (r > 32);
+    Log("启动程序: exe=%s, file=%s, result=%s (code=%d)",
+        exe, filePath, success ? "成功" : "失败", (int)r);
+    return success;
 }
 
 // ============================================================================
@@ -90,10 +136,16 @@ static bool SafeLaunchApp(const char* exe, const char* filePath) {
 //  如需调试时看输出，将入口换回 main 并去掉 MINIZ_NO_STDIO
 // ============================================================================
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR lpCmdLine, int) {
+    // 初始化日志目录
+    InitLogDir();
+
+    Log("========== 程序启动 ==========");
+
     // ── 1. 解析命令行，取第一个参数作为 PPTX 路径 ──────────────────────────
     int argc = 0;
     LPWSTR* argvW = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (!argvW || argc < 2) {
+        Log("错误：命令行参数不足 (argc=%d)", argc);
         if (argvW) LocalFree(argvW);
         return 1;
     }
@@ -103,10 +155,26 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR lpCmdLine, int) {
     WideCharToMultiByte(CP_ACP, 0, argvW[1], -1, pptxPath, MAX_PATH, nullptr, nullptr);
     LocalFree(argvW);
 
-    if (pptxPath[0] == '\0') return 1;
+    if (pptxPath[0] == '\0') {
+        Log("错误：路径转换失败");
+        return 1;
+    }
+
+    Log("目标文件: %s", pptxPath);
+    Log("PowerPoint 路径: %s", PATH_POWERPOINT);
+    Log("WPS 路径: %s", PATH_WPS);
+
+    // 检查 PowerPoint 是否存在
+    bool pptExists = (GetFileAttributesA(PATH_POWERPOINT) != INVALID_FILE_ATTRIBUTES);
+    Log("PowerPoint 文件存在: %s", pptExists ? "是" : "否");
+
+    // 检查 WPS 是否存在
+    bool wpsExists = (GetFileAttributesA(PATH_WPS) != INVALID_FILE_ATTRIBUTES);
+    Log("WPS 文件存在: %s", wpsExists ? "是" : "否");
 
     // ── 2. 文件存在性检查 ────────────────────────────────────────────────────
     if (GetFileAttributesA(pptxPath) == INVALID_FILE_ATTRIBUTES) {
+        Log("错误：文件不存在，尝试用 WPS 兜底打开");
         SafeLaunchApp(PATH_WPS, pptxPath); // 兜底
         return 1;
     }
@@ -117,6 +185,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR lpCmdLine, int) {
 
     if (!mz_zip_reader_init_file(&zip, pptxPath,
                                   MZ_ZIP_FLAG_DO_NOT_SORT_CENTRAL_DIRECTORY)) {
+        Log("错误：无法打开 ZIP 文件，尝试用 WPS 兜底打开");
         SafeLaunchApp(PATH_WPS, pptxPath);
         return 1;
     }
@@ -136,6 +205,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR lpCmdLine, int) {
     }
     // guard 析构时自动调用 mz_zip_reader_end
 
+    Log("检测到 Application: %s", appName.empty() ? "(空)" : appName.c_str());
+
     // ── 5. 决策：优先精确匹配，再宽泛匹配，最后兜底 ─────────────────────────
     bool launched = false;
 
@@ -145,11 +216,22 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR lpCmdLine, int) {
         const bool isMSO  = (appName.find("Microsoft") != std::string::npos)
                           || (appName.find("PowerPoint") != std::string::npos);
 
-        if (isWPS)       launched = SafeLaunchApp(PATH_WPS, pptxPath);
-        else if (isMSO)  launched = SafeLaunchApp(PATH_POWERPOINT, pptxPath);
+        Log("判断结果: isWPS=%d, isMSO=%d", isWPS, isMSO);
+
+        if (isWPS) {
+            Log("决策：使用 WPS 打开");
+            launched = SafeLaunchApp(PATH_WPS, pptxPath);
+        } else if (isMSO) {
+            Log("决策：使用 PowerPoint 打开");
+            launched = SafeLaunchApp(PATH_POWERPOINT, pptxPath);
+        }
     }
 
-    if (!launched) SafeLaunchApp(PATH_WPS, pptxPath); // 兜底 WPS
+    if (!launched) {
+        Log("兜底：使用 WPS 打开");
+        SafeLaunchApp(PATH_WPS, pptxPath); // 兜底 WPS
+    }
 
+    Log("========== 程序结束 ==========\n");
     return 0;
 }
