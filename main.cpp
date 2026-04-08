@@ -13,6 +13,9 @@
  *    5. RAII 风格的 ZipGuard 确保 zip 套柄始终被关闭
  *    6. SW_SHOWNORMAL 替代 SW_SHOW，行为更稳定
  *    7. 日志记录，便于排查问题
+ *    8. QuickGetTag 优化：手动构建标签字符串，避免 snprintf 开销
+ *    9. 决策逻辑优化：使用 C 字符串手动匹配，避免 std::string::find 开销
+ *   10. 提前空指针和空字符串检查，减少无效计算
  * ============================================================================
  */
 
@@ -91,15 +94,35 @@ struct ZipGuard {
 //  QuickGetTag
 //  纯 C 字符串操作，在 [src, src+len) 内提取 <tag>...</tag> 之间的内容。
 //  不构造临时 std::string 标签，减少堆分配。
+//  优化：直接扫描，避免 snprintf 开销
 // ============================================================================
 static std::string QuickGetTag(const char* src, size_t len, const char* tag) {
-    if (!src || len == 0 || !tag) return {};
+    if (!src || len == 0 || !tag || !tag[0]) return {};
 
-    // 在栈上构造 "<tag>" 和 "</tag>"（最大支持 63 字节标签名）
-    char sTag[128], eTag[128];
-    const int sLen = _snprintf_s(sTag, sizeof(sTag), _TRUNCATE, "<%s>", tag);
-    const int eLen = _snprintf_s(eTag, sizeof(eTag), _TRUNCATE, "</%s>", tag);
-    if (sLen <= 0 || eLen <= 0) return {};
+    const size_t tagLen = strlen(tag);
+    if (tagLen > 64) return {}; // 标签名过长，拒绝
+
+    // 直接在栈上构建起始和结束标记
+    char sTag[72], eTag[74]; // "<" + tag + ">" + \0, "</" + tag + ">" + \0
+    char* ps = sTag;
+    char* pe = eTag;
+    
+    *ps++ = '<';
+    memcpy(ps, tag, tagLen);
+    ps[tagLen] = '>';
+    ps[tagLen + 1] = '\0';
+    
+    *pe++ = '<';
+    *pe++ = '/';
+    memcpy(pe, tag, tagLen);
+    pe[tagLen] = '>';
+    pe[tagLen + 1] = '\0';
+
+    const size_t sLen = tagLen + 1; // "<tag>"
+    const size_t eLen = tagLen + 3; // "</tag>"
+
+    // 快速路径：如果源数据小于两个标签长度，直接返回
+    if (len < sLen + eLen) return {};
 
     // strstr 即可：miniz 解压出的 XML 缓冲区末尾有 \0
     const char* p = strstr(src, sTag);
@@ -211,12 +234,51 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR lpCmdLine, int) {
     bool launched = false;
 
     if (!appName.empty()) {
-        const bool isWPS  = (appName.find("WPS")      != std::string::npos)
-                          || (appName.find("Kingsoft") != std::string::npos);
-        const bool isMSO  = (appName.find("Microsoft") != std::string::npos)
-                          || (appName.find("PowerPoint") != std::string::npos);
+        // 优化：使用 C 字符串手动匹配，避免 std::string::find 的虚函数和迭代器开销
+        const char* appStr = appName.c_str();
+        const size_t appLen = appName.length();
+        
+        // 快速路径：检查是否包含 WPS 或 Kingsoft 特征
+        bool isWPS = false;
+        if (appLen >= 3) {
+            for (size_t i = 0; i <= appLen - 3; ++i) {
+                if (appStr[i] == 'W' && appStr[i+1] == 'P' && appStr[i+2] == 'S') {
+                    isWPS = true;
+                    break;
+                }
+            }
+        }
+        if (!isWPS && appLen >= 8) {
+            for (size_t i = 0; i <= appLen - 8; ++i) {
+                if (strncmp(appStr + i, "Kingsoft", 8) == 0) {
+                    isWPS = true;
+                    break;
+                }
+            }
+        }
+        
+        // 快速路径：检查是否包含 Microsoft 或 PowerPoint 特征
+        bool isMSO = false;
+        if (!isWPS) {
+            if (appLen >= 9) {
+                for (size_t i = 0; i <= appLen - 9; ++i) {
+                    if (strncmp(appStr + i, "Microsoft", 9) == 0) {
+                        isMSO = true;
+                        break;
+                    }
+                }
+            }
+            if (!isMSO && appLen >= 10) {
+                for (size_t i = 0; i <= appLen - 10; ++i) {
+                    if (strncmp(appStr + i, "PowerPoint", 10) == 0) {
+                        isMSO = true;
+                        break;
+                    }
+                }
+            }
+        }
 
-        Log("判断结果: isWPS=%d, isMSO=%d", isWPS, isMSO);
+        Log("判断结果：isWPS=%d, isMSO=%d", isWPS, isMSO);
 
         if (isWPS) {
             Log("决策：使用 WPS 打开");
